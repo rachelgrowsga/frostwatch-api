@@ -14,7 +14,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 # NWS asks every client to identify itself. Put your real contact info here.
-USER_AGENT = "FrostWatch (contact: rachelgrowsga@gmail.com)"
+USER_AGENT = "FrostWatch (contact: you@example.com)"
 
 app = FastAPI(title="FrostWatch API")
 
@@ -39,7 +39,7 @@ FROST_RANGE_F = 36  # hours at or below this count as the "cold window"
 # level: (short answer, headline wording)
 ANSWERS = {
     0: ("No", "No frost expected"),
-    1: ("Maybe", "Frost possible"),
+    1: ("Low risk", "Frost possible"),
     2: ("Yes", "Frost likely"),
     3: ("Yes", "Freeze expected"),
     4: ("Yes", "Hard freeze expected"),
@@ -162,6 +162,11 @@ def build_nights(periods, max_nights=3):
                 "cold_window": cold_window,
             }
         )
+    # A night already underway with no frost risk isn't worth leading with.
+    # Skip it so the first answer is about the coming night.
+    if len(results) > 1 and results[0]["when"] == "this morning" and results[0]["level"] == 0:
+        results.pop(0)
+
     return results[:max_nights]
 
 
