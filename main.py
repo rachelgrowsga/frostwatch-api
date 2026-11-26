@@ -7,14 +7,14 @@ The scoring in score_night() is a simple STARTER method. Replace it with
 your own thresholds and logic.
 """
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, time as dtime, timedelta
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 # NWS asks every client to identify itself. Put your real contact info here.
-USER_AGENT = "FrostWatch (contact: you@example.com)"
+USER_AGENT = "FrostWatch (contact: rachelgrowsga@gmail.com)"
 
 app = FastAPI(title="FrostWatch API")
 
@@ -111,6 +111,42 @@ async def nws_hourly(client, lat, lon):
     return h.json()["properties"]["periods"]
 
 
+def build_timeline(key, coldest_start, cold_starts, periods):
+    """When a gardener should act, built around a normal day.
+
+    Cover: before the cold arrives, but never later than midnight, since
+    nobody is out there at 2 AM. Uncover: once it is daytime and back above
+    the frost range.
+    """
+    now = datetime.fromisoformat(periods[0]["startTime"])
+    midnight = datetime.combine(key + timedelta(days=1), dtime(0, 0), tzinfo=coldest_start.tzinfo)
+    cover = min(cold_starts[0] - timedelta(hours=1), midnight)
+
+    if cover <= now:
+        mode, cover = "now", now
+    elif cover == midnight:
+        mode = "midnight"
+    else:
+        mode = "before"
+
+    last_cold = cold_starts[-1]
+    uncover = last_cold + timedelta(hours=1)
+    for p in periods:
+        start = datetime.fromisoformat(p["startTime"])
+        if start > last_cold and p.get("isDaytime") and p["temperature"] > FROST_RANGE_F:
+            uncover = start
+            break
+
+    return {
+        "cover_mode": mode,
+        "cover_label": fmt_hour(cover),
+        "cover_at": cover.isoformat(),
+        "low_at": f"{fmt_hour(coldest_start)} {coldest_start.strftime('%A')}",
+        "uncover_label": f"{fmt_hour(uncover)} {uncover.strftime('%A')}",
+        "uncover_at": uncover.isoformat(),
+    }
+
+
 def build_nights(periods, max_nights=3):
     """Group hours from 6 PM to 9 AM into nights and score each one.
 
@@ -138,28 +174,33 @@ def build_nights(periods, max_nights=3):
         if not in_progress and len(hours) < 6:
             continue  # partial night at the far end of the forecast
 
-        coldest = min(hours, key=lambda x: x[1]["temperature"])[1]
+        coldest_start, coldest = min(hours, key=lambda x: x[1]["temperature"])
         low_f = coldest["temperature"]
         dew_f = c_to_f((coldest.get("dewpoint") or {}).get("value"))
         wind = parse_wind_mph(coldest.get("windSpeed"))
         level, label, note = score_night(low_f, dew_f, wind)
 
-        cold = [s for s, p in hours if p["temperature"] <= FROST_RANGE_F]
-        cold_window = None
-        if cold:
-            cold_window = f"{fmt_hour(cold[0])} to {fmt_hour(cold[-1] + timedelta(hours=1))}"
+        timeline = None
+        cold_starts = [s for s, p in hours if p["temperature"] <= FROST_RANGE_F]
+        if level >= 1 and cold_starts:
+            timeline = build_timeline(key, coldest_start, cold_starts, periods)
+
+        night_word = "morning" if in_progress else "night"
+        weekday = (key + timedelta(days=1)).strftime("%A") if in_progress else key.strftime("%A")
 
         results.append(
             {
                 "night_of": key.isoformat(),
                 "when": when_phrase(key, today),
+                "weekday_night": f"{weekday} {night_word}",
                 "low_f": round(low_f),
                 "dewpoint_f": None if dew_f is None else round(dew_f),
                 "wind_mph": wind,
                 "level": level,
                 "label": label,
                 "note": note,
-                "cold_window": cold_window,
+                "timeline": timeline,
+                "colder": False,
             }
         )
     # A night already underway with no frost risk isn't worth leading with.
@@ -176,6 +217,8 @@ def build_response(zip_code, place, periods):
     summary = None
     if nights:
         first = nights[0]
+        for n in nights[1:]:
+            n["colder"] = n["level"] > first["level"]
         answer, wording = ANSWERS[first["level"]]
         heads_up = None
         later = [n for n in nights[1:] if n["level"] >= 2 and n["level"] > first["level"]]
@@ -227,6 +270,10 @@ async def frost_risk(zip: str = Query(..., min_length=5, max_length=5)):
     async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
         lat, lon, place = await zip_to_latlon(client, zip)
         periods = await nws_hourly(client, lat, lon)
+
+    data = build_response(zip, place, periods)
+    _cache[zip] = (datetime.utcnow(), data)
+    return data
 
     data = build_response(zip, place, periods)
     _cache[zip] = (datetime.utcnow(), data)
