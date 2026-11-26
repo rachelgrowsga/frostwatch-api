@@ -1,7 +1,7 @@
 """FrostWatch starter API.
 
-GET /frost-risk?zip=30301 returns a 3-night frost/freeze outlook built from
-the National Weather Service hourly forecast.
+GET /frost-risk?zip=30301 returns a tonight-first frost outlook plus the next
+two nights, built from the National Weather Service hourly forecast.
 
 The scoring in score_night() is a simple STARTER method. Replace it with
 your own thresholds and logic.
@@ -31,6 +31,20 @@ app.add_middleware(
 _cache: dict = {}
 CACHE_MINUTES = 30
 
+# The "night" runs from 6 PM to 9 AM local time.
+NIGHT_START_HOUR = 18
+NIGHT_END_HOUR = 9
+FROST_RANGE_F = 36  # hours at or below this count as the "cold window"
+
+# level: (short answer, headline wording)
+ANSWERS = {
+    0: ("No", "No frost expected"),
+    1: ("Maybe", "Frost possible"),
+    2: ("Yes", "Frost likely"),
+    3: ("Yes", "Freeze expected"),
+    4: ("Yes", "Hard freeze expected"),
+}
+
 
 def c_to_f(c):
     return None if c is None else c * 9 / 5 + 32
@@ -55,9 +69,24 @@ def score_night(low_f, dew_f, wind_mph):
         # Frost needs a cold surface, so a dry, breezy night lowers the odds.
         spread = low_f - dew_f if dew_f is not None else 0
         if wind_mph <= 7 and spread <= 6:
-            return 2, "Frost likely", "Calm, humid and near freezing. Frost can form on leaves."
+            return 2, "Frost likely", "Calm, humid and near freezing. Protect tender plants."
         return 1, "Frost possible", "Near freezing, but wind or dry air may keep frost off."
-    return 0, "No frost", "Lows stay above frost range."
+    return 0, "No frost", "Lows stay above frost range. No protection needed."
+
+
+def fmt_hour(dt):
+    return dt.strftime("%I %p").lstrip("0")
+
+
+def when_phrase(night_date, today):
+    days = (night_date - today).days
+    if days < 0:
+        return "this morning"
+    if days == 0:
+        return "tonight"
+    if days == 1:
+        return "tomorrow night"
+    return night_date.strftime("%A") + " night"
 
 
 async def zip_to_latlon(client, zip_code):
@@ -83,37 +112,97 @@ async def nws_hourly(client, lat, lon):
 
 
 def build_nights(periods, max_nights=3):
-    """Group hours from 6 PM to 9 AM into nights and score each one."""
+    """Group hours from 6 PM to 9 AM into nights and score each one.
+
+    A night already underway (for example at 3 AM) is kept and labelled
+    "this morning" until too little of it is left to matter.
+    """
+    if not periods:
+        return []
+    today = datetime.fromisoformat(periods[0]["startTime"]).date()
+
     nights: dict = {}
     for p in periods:
         start = datetime.fromisoformat(p["startTime"])
-        if not (start.hour >= 18 or start.hour < 9):
+        if not (start.hour >= NIGHT_START_HOUR or start.hour < NIGHT_END_HOUR):
             continue
         key = (start - timedelta(hours=12)).date()
-        nights.setdefault(key, []).append(p)
+        nights.setdefault(key, []).append((start, p))
 
     results = []
-    for key in sorted(nights)[: max_nights + 1]:
+    for key in sorted(nights):
         hours = nights[key]
-        if len(hours) < 6:  # skip a partial night at the very start or end
-            continue
-        coldest = min(hours, key=lambda x: x["temperature"])
+        in_progress = key < today
+        if in_progress and len(hours) < 2:
+            continue  # almost over, skip it
+        if not in_progress and len(hours) < 6:
+            continue  # partial night at the far end of the forecast
+
+        coldest = min(hours, key=lambda x: x[1]["temperature"])[1]
         low_f = coldest["temperature"]
         dew_f = c_to_f((coldest.get("dewpoint") or {}).get("value"))
         wind = parse_wind_mph(coldest.get("windSpeed"))
         level, label, note = score_night(low_f, dew_f, wind)
+
+        cold = [s for s, p in hours if p["temperature"] <= FROST_RANGE_F]
+        cold_window = None
+        if cold:
+            cold_window = f"{fmt_hour(cold[0])} to {fmt_hour(cold[-1] + timedelta(hours=1))}"
+
         results.append(
             {
                 "night_of": key.isoformat(),
+                "when": when_phrase(key, today),
                 "low_f": round(low_f),
                 "dewpoint_f": None if dew_f is None else round(dew_f),
                 "wind_mph": wind,
                 "level": level,
                 "label": label,
                 "note": note,
+                "cold_window": cold_window,
             }
         )
     return results[:max_nights]
+
+
+def build_response(zip_code, place, periods):
+    nights = build_nights(periods)
+
+    summary = None
+    if nights:
+        first = nights[0]
+        answer, wording = ANSWERS[first["level"]]
+        heads_up = None
+        later = [n for n in nights[1:] if n["level"] >= 2 and n["level"] > first["level"]]
+        if later:
+            worst = max(later, key=lambda n: n["level"])
+            heads_up = f'Heads up: {worst["label"].lower()} expected {worst["when"]}.'
+        summary = {
+            "answer": answer,
+            "headline": f'{wording} {first["when"]}',
+            "heads_up": heads_up,
+        }
+
+    series = []
+    for p in periods[:72]:
+        dew = c_to_f((p.get("dewpoint") or {}).get("value"))
+        series.append(
+            {
+                "t": p["startTime"],
+                "temp": p["temperature"],
+                "dew": None if dew is None else round(dew),
+            }
+        )
+
+    return {
+        "zip": zip_code,
+        "place": place,
+        "summary": summary,
+        "worst_level": max((n["level"] for n in nights), default=0),
+        "nights": nights,
+        "hourly": series,
+        "source": "National Weather Service hourly forecast",
+    }
 
 
 @app.get("/")
@@ -134,13 +223,6 @@ async def frost_risk(zip: str = Query(..., min_length=5, max_length=5)):
         lat, lon, place = await zip_to_latlon(client, zip)
         periods = await nws_hourly(client, lat, lon)
 
-    nights = build_nights(periods)
-    data = {
-        "zip": zip,
-        "place": place,
-        "worst_level": max((n["level"] for n in nights), default=0),
-        "nights": nights,
-        "source": "National Weather Service hourly forecast",
-    }
+    data = build_response(zip, place, periods)
     _cache[zip] = (datetime.utcnow(), data)
     return data
