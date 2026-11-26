@@ -14,7 +14,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 # NWS asks every client to identify itself. Put your real contact info here.
-USER_AGENT = "FrostWatch (contact: you@example.com)"
+USER_AGENT = "FrostWatch (contact: rachelgrowsga@gmail.com)"
 
 app = FastAPI(title="FrostWatch API")
 
